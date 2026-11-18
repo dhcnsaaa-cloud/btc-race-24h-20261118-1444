@@ -1,19 +1,21 @@
 """Dip-bounce mean-reversion bot for cbBTC (CBBTC/USDC), 1-minute bars.
+Aggressive variant (N60): shorter 1-hour trailing high, shallower dip,
+shorter cooldown — catches the early bounces the 3-hour version misses.
 
-Strategy, in one line: buy a confirmed dip below the 3-hour trailing high,
+Strategy, in one line: buy a confirmed dip below the 1-hour trailing high,
 sell when the position is 0.6% in profit, cut it if it falls 2% under cost.
 
 Rules, all in integer arithmetic so two runs on the same bars are identical:
-- Trailing high: the highest close of the last 180 bars (3 hours), not
+- Trailing high: the highest close of the last 60 bars (1 hour), not
   counting the current bar.
-- FLAT and the close is 1.2% or more below that trailing high AND the last
+- FLAT and the close is 1.0% or more below that trailing high AND the last
   3 closes rose in a row (bounce confirmation) -> buy with all cash.
 - LONG and the position's value is 0.6% or more above its cost (fees
   included) -> sell everything (take profit).
 - LONG and the position's value is 2% or more below its cost -> sell
   everything (stop-loss).
-- After a sale, stay out for 60 bars before buying again.
-- Never trade during warm-up batches, never trade before 180 closes exist,
+- After a sale, stay out for 30 bars before buying again.
+- Never trade during warm-up batches, never trade before 60 closes exist,
   never order when the batch carries no CBBTC bar.
 - One order per reply at most, max_slippage_bps 100 (1%): a fill that would
   land more than 1% away from the close we decided on is refused instead.
@@ -24,22 +26,35 @@ Rules, all in integer arithmetic so two runs on the same bars are identical:
 - No clock, no network, no files, no randomness: the orders are a pure
   function of the bars the harness sent.
 
-Why this shape: on 1-minute bars the price is noise (about 4 bps per bar)
-around slow multi-hour swings of roughly 1%. Chasing the noise pays the
-~26 bps round-trip cost on every whipsaw and loses. Waiting for a real dip
-(1.2% below the 3-hour high) confirmed by 3 rising bars, then selling a
-modest 0.6% profit, catches the swing and pays the cost only a few times
-a day. The 0.6% take-profit is deliberately small: on this window the
-recovery after a dip rarely runs far before fading, and a bigger target
-(0.7%+) leaves the bot holding through the fade into the stop-loss.
-The 3-bar bounce filter is what keeps the bot out of a falling knife:
-a dip with no bounce is a market still falling, not a buying opportunity.
+Why this shape: the 3-hour version (N180, dip 1.2%, cooldown 60) is
+conservative — it waits for a deep dip below a slow-moving high and
+catches only 2 bounces on the dev window (+$10.98). A 60-bar trailing
+high hugs the falling price much closer, so a 1.0% dip below it fires
+earlier, and the 30-bar cooldown lets the bot re-enter sooner. On the
+dev window this catches 2 early bounces the slow version misses
+(bar 73->81 +$5.80 and bar 111->407 +$6.34) for +$12.13. The trade-off:
+in the second half of the dev window the fast high adapts to the drift
+so no setup ever fires (h2 $0.00) — the bot is a first-half bot on this
+window. It is the aggressive sibling of the conservative entry, not a
+replacement: both race, and the aggressive one wins when the live window
+has early dips.
 
 Backtest (exact integer fill model, dev window 2026-11-17 14:44 UTC ->
 2026-11-18 14:44 UTC, BTC -2.80%, buy-and-hold -$31.63):
-  dev PnL +$10.98 (+1.10%), max drawdown 0.62%, 2 round trips (both wins),
-  fees $1.61, first half +$5.25, second half +$5.73, +$9.37 at 2x fees.
-  Same bot on the 2026-11-16/17 window (flat +0.49%): +$4.46.
+  dev PnL +$12.13 (+1.21%), max drawdown 1.00%, 2 round trips (both wins),
+  fees $1.61, first half +$12.13, second half $0.00, +$10.52 at 2x fees.
+  Same bot on the 2026-11-16/17 window (flat +0.49%): +$9.44.
+  Head-to-head vs the conservative N180 across 5 windows (1444, 0603,
+  0828, 2314, scratch): N60 wins 4, ties 1, loses 0; aggregate
+  -$7.07 vs -$56.98.
+
+Replay verification (replay-driver.py, real main.py over the wire
+protocol, exact integer fill model): 1x PnL +$12.13, DD 1.00%, fees
+$1.61 — identical to the backtest to the cent. Trades: buy bar 73
+$63,870.54 -> sell bar 81 $64,292.18 (+$5.80); buy bar 111 $63,999.24
+-> sell bar 407 $64,454.08 (+$6.34). 2x fees: PnL +$10.52, DD 1.08%.
+One order was rejected by the harness (slippage/impact guard) and the
+bot carried on — the PnL above already counts it.
 """
 
 import os
@@ -50,21 +65,21 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "ven
 import makefun_bars
 
 SYMBOL = "CBBTC"
-WINDOW = 180           # bars in the trailing high (3 hours of 1-minute bars)
-DIP_NUM = 988          # buy when close <= trailing high * 988/1000 (1.2% below)
+WINDOW = 60            # bars in the trailing high (1 hour of 1-minute bars)
+DIP_NUM = 990          # buy when close <= trailing high * 990/1000 (1.0% below)
 DIP_DEN = 1000
 BOUNCE = 3             # consecutive rising closes required before buying
 TP_NUM = 1006          # sell when value >= cost * 1006/1000 (+0.6%)
 TP_DEN = 1000
 STOP_NUM = 98          # sell when value <= cost * 98/100 (2% below cost)
 STOP_DEN = 100
-COOLDOWN_BARS = 60     # bars to stay out after a sale before buying again
+COOLDOWN_BARS = 30     # bars to stay out after a sale before buying again
 MAX_SLIP_BPS = 100     # refuse a fill more than 1% from the decided close
 MAX_IMPACT_BPS = 30    # skip a buy when the pool impact alone would eat half the take-profit
 
 
 class DipBounceBot:
-    """Trailing 180-bar high + 3-bar bounce confirmation + TP/SL."""
+    """Trailing 60-bar high + 3-bar bounce confirmation + TP/SL."""
 
     def __init__(self):
         self.closes = deque(maxlen=WINDOW)
@@ -78,7 +93,7 @@ class DipBounceBot:
 
     def note_bar(self, bar):
         close = int(bar["c"])
-        # Trailing high: max of the closes BEFORE this bar (None until 180 exist).
+        # Trailing high: max of the closes BEFORE this bar (None until 60 exist).
         self.last_high = max(self.closes) if len(self.closes) == WINDOW else None
         # Bounce count: consecutive closes rising into this bar.
         if self.prev_close is not None:

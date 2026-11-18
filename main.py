@@ -17,6 +17,10 @@ Rules, all in integer arithmetic so two runs on the same bars are identical:
   never order when the batch carries no CBBTC bar.
 - One order per reply at most, max_slippage_bps 100 (1%): a fill that would
   land more than 1% away from the close we decided on is refused instead.
+- Price-impact guard on buys: skip the buy when the pool impact of the
+  full-cash order is over 30 bps (half the take-profit). Never fires on
+  the dev window (deep pool, a few bps); it only protects the live race
+  if the pool ever runs shallow.
 - No clock, no network, no files, no randomness: the orders are a pure
   function of the bars the harness sent.
 
@@ -56,6 +60,7 @@ STOP_NUM = 98          # sell when value <= cost * 98/100 (2% below cost)
 STOP_DEN = 100
 COOLDOWN_BARS = 60     # bars to stay out after a sale before buying again
 MAX_SLIP_BPS = 100     # refuse a fill more than 1% from the decided close
+MAX_IMPACT_BPS = 30    # skip a buy when the pool impact alone would eat half the take-profit
 
 
 class DipBounceBot:
@@ -115,6 +120,14 @@ class DipBounceBot:
                 }]
             return []
         if state.seq < self.cooldown_until:
+            return []
+        # Price-impact guard: a buy that pays more than 30 bps of pool impact
+        # has already lost half the 0.6% take-profit before the trade even
+        # starts. On a deep BTC pool the impact of a $1,000 buy is a few bps,
+        # so this never fires on the dev window; it only protects the live
+        # race if the pool ever runs shallow.
+        impact = state.impact_bps(SYMBOL, state.cash)
+        if impact is None or impact > MAX_IMPACT_BPS:
             return []
         if (self.last_up >= BOUNCE
                 and self.last_close is not None
